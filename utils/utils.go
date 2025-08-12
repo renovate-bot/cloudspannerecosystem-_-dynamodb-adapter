@@ -23,7 +23,6 @@ import (
 	"strconv"
 	"strings"
 
-	"cloud.google.com/go/spanner"
 	"github.com/antonmedv/expr"
 	"github.com/cloudspannerecosystem/dynamodb-adapter/models"
 	"github.com/cloudspannerecosystem/dynamodb-adapter/pkg/errors"
@@ -60,15 +59,126 @@ func GetStringInBetween(str string, start string, end string) (result string) {
 	return str[s:e]
 }
 
+// stripWrappingParens removes unnecessary wrapping or unmatched parentheses from a string.
+//
+// - If the string is wrapped in balanced parentheses, it removes the outermost pair(s).
+// - If there are unmatched leading or trailing parentheses, it removes them until balanced.
+// - It preserves valid, balanced parentheses inside the string.
+//
+// Examples:
+//
+//	stripWrappingParens("(foo)")            // "foo"
+//	stripWrappingParens("((foo))")          // "foo"
+//	stripWrappingParens("(foo")             // "foo"
+//	stripWrappingParens("foo)")             // "foo"
+//	stripWrappingParens("((foo)")           // "foo"
+//	stripWrappingParens("(size(bar))")      // "size(bar)"
+//	stripWrappingParens("(size(bar)")       // "size(bar)"
+//	stripWrappingParens("size(bar))")       // "size(bar)"
+//	stripWrappingParens("size(bar)")        // "size(bar)"
+//	stripWrappingParens("foo(bar(baz))")    // "foo(bar(baz))"
+//	stripWrappingParens("((foo(bar)))")     // "foo(bar)"
+func stripWrappingParens(s string) string {
+	s = strings.TrimSpace(s)
+	// Remove balanced wrapping parentheses
+	for {
+		changed := false
+		// Remove balanced outermost parens
+		for strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") && len(s) > 1 {
+			inner := s[1 : len(s)-1]
+			if countParens(inner) == 0 {
+				s = strings.TrimSpace(inner)
+				changed = true
+			} else {
+				break
+			}
+		}
+		// Remove unmatched leading paren
+		if strings.HasPrefix(s, "(") && countParens(s) > 0 {
+			s = strings.TrimSpace(s[1:])
+			changed = true
+		}
+		// Remove unmatched trailing paren
+		if strings.HasSuffix(s, ")") && countParens(s) < 0 {
+			s = strings.TrimSpace(s[:len(s)-1])
+			changed = true
+		}
+		if !changed {
+			break
+		}
+	}
+	return s
+}
+
+// Helper: returns open parens minus close parens
+func countParens(s string) int {
+	open := 0
+	close := 0
+	for _, c := range s {
+		if c == '(' {
+			open++
+		} else if c == ')' {
+			close++
+		}
+	}
+	return open - close
+}
+
+// cleanExpressionSpacing removes unnecessary spaces between function names and their opening parenthesis
+// in a DynamoDB expression, while preserving spaces for logical operators like AND, OR, etc. This is needed
+// since logic below splits tokens by spaces.
+//
+// For example, it converts:
+//
+//	"attribute_exists (foo) AND begins_with (bar, :val)"
+//
+// to:
+//
+//	"attribute_exists(foo) AND begins_with(bar, :val)"
+//
+// Logical operators (AND, OR, etc.) are not affected, so their spacing remains
+func cleanExpressionSpacing(expression string) string {
+	// Regex to find words followed by any whitespace (space, tab, etc.) and (
+	re := regexp.MustCompile(`\b(\w+)\s+\(`)
+
+	// List of logical operators to exclude
+	logicalOps := map[string]bool{
+		"AND": true,
+		"and": true,
+		"OR":  true,
+		"or":  true,
+	}
+
+	// Use ReplaceAllStringFunc to process each match
+	return re.ReplaceAllStringFunc(expression, func(m string) string {
+		// Extract the word before whitespace+(
+		// m is like "attribute_exists (" or "attribute_exists\t("
+		parts := regexp.MustCompile(`\s+`).Split(m, 2)
+		if len(parts) != 2 {
+			return m
+		}
+		word := parts[0]
+		if logicalOps[word] {
+			// If logical operator, don't change spacing
+			return m
+		}
+		// Otherwise remove all whitespace before '('
+		return word + "("
+	})
+}
+
 // CreateConditionExpression - create evelute condition from condition
 func CreateConditionExpression(condtionExpression string, expressionAttr map[string]interface{}) (*models.Eval, error) {
 	if condtionExpression == "" {
 		e := new(models.Eval)
 		return e, nil
 	}
+	logger.Debug("Original condition expression:", condtionExpression)
 	condtionExpression = strings.TrimSpace(condtionExpression)
 	condtionExpression = strings.ReplaceAll(condtionExpression, "( ", "(")
 	condtionExpression = strings.ReplaceAll(condtionExpression, " )", ")")
+	condtionExpression = strings.ReplaceAll(condtionExpression, "NOT ", "!")
+	condtionExpression = cleanExpressionSpacing(condtionExpression)
 	tokens := strings.Split(condtionExpression, " ")
 	sb := strings.Builder{}
 	evalTokens := []string{}
@@ -76,18 +186,25 @@ func CreateConditionExpression(condtionExpression string, expressionAttr map[str
 	ts := []string{}
 	var err error
 	for i := 0; i < len(tokens); i++ {
+		token := tokens[i]
 		if i%2 == 0 {
-			if strings.Contains(tokens[i], ":") {
-				v, ok := expressionAttr[tokens[i]]
+			isNegated := false
+			if strings.HasPrefix(token, "!") {
+				isNegated = true
+				token = strings.TrimPrefix(token, "!")
+			}
+			token = stripWrappingParens(token)
+			if strings.Contains(token, ":") {
+				v, ok := expressionAttr[token]
 				if !ok {
-					return nil, errors.New("ResourceNotFoundException", expressionAttr, tokens[i])
+					return nil, errors.New("ResourceNotFoundException", expressionAttr, token)
 				}
 				str := fmt.Sprint(v)
 				_, ok = v.(string)
 				if ok {
 					str = "\"" + str + "\""
 				}
-				switch v.(type) {
+				switch v.(type) { // TODO: Support timestamp and big.rat
 				case float64:
 					str = fmt.Sprintf("%f", v)
 				case int64:
@@ -96,7 +213,7 @@ func CreateConditionExpression(condtionExpression string, expressionAttr map[str
 					// Handle lists by converting them to JSON for easier evaluation
 					listBytes, err := json.Marshal(v)
 					if err != nil {
-						return nil, errors.New("InvalidListException", err.Error(), tokens[i])
+						return nil, errors.New("InvalidListException", err.Error(), token)
 					}
 					str = string(listBytes)
 				}
@@ -106,14 +223,17 @@ func CreateConditionExpression(condtionExpression string, expressionAttr map[str
 			}
 
 			t := "TOKEN" + strconv.Itoa(i)
-			col := GetFieldNameFromConditionalExpression(tokens[i])
-			sb.WriteString(t)
-			sb.WriteString(" ")
-			evalTokens = append(evalTokens, tokens[i])
+			col := GetFieldNameFromConditionalExpression(token)
+			if isNegated {
+				sb.WriteString("!(" + t + ") ")
+			} else {
+				sb.WriteString(t + " ")
+			}
+			evalTokens = append(evalTokens, token)
 			cols = append(cols, col)
 			ts = append(ts, t)
 		} else {
-			sb.WriteString(tokens[i])
+			sb.WriteString(token)
 			sb.WriteString(" ")
 		}
 	}
@@ -125,6 +245,7 @@ func CreateConditionExpression(condtionExpression string, expressionAttr map[str
 	str = strings.ReplaceAll(str, " and ", " && ")
 	str = strings.ReplaceAll(str, " AND ", " && ")
 	str = strings.ReplaceAll(str, " <> ", " != ")
+
 	e.Cond, err = expr.Compile(str)
 	if err != nil {
 		return nil, errors.New("ConditionalCheckFailedException", err.Error(), str)
@@ -192,6 +313,7 @@ func ChangeTableNameForSpanner(tableName string) string {
 }
 
 // Convert DynamoDB data types to equivalent Spanner types
+// Only used by initialization code to create tables
 func ConvertDynamoTypeToSpannerType(dynamoType string) string {
 	switch dynamoType {
 	case "S":
@@ -286,77 +408,6 @@ func RemoveListElement(list []interface{}, idx int) []interface{} {
 	return append(list[:idx], list[idx+1:]...)
 }
 
-// IsValidJSONObject checks if a string is a valid JSON object
-func IsValidJSONObject(s string) error {
-	var js map[string]interface{}
-	err := json.Unmarshal([]byte(s), &js)
-	return err
-}
-
-func IsValidBase64(s string) bool {
-	if _, err := base64.StdEncoding.DecodeString(s); err != nil {
-		return false
-	}
-	return true
-}
-func ParseBytes(r *spanner.Row, i int, k string) (map[string]interface{}, error) {
-	var s []byte
-	singleRowImg := make(map[string]interface{})
-	err := r.Column(i, &s)
-	if err != nil {
-		if strings.Contains(err.Error(), "ambiguous column name") {
-			return nil, err
-		}
-		return nil, errors.New("ValidationException", err, k)
-	}
-	if len(s) > 0 {
-		var m interface{}
-		err := json.Unmarshal(s, &m)
-		if err != nil {
-			logger.LogError(err, string(s))
-			singleRowImg[k] = string(s)
-		}
-		val1, ok := m.(string)
-		if ok {
-			if base64Regexp.MatchString(val1) {
-				ba, err := base64.StdEncoding.DecodeString(val1)
-				if err == nil {
-					var sample interface{}
-					err = json.Unmarshal(ba, &sample)
-					if err == nil {
-						singleRowImg[k] = sample
-
-					} else {
-						singleRowImg[k] = string(s)
-
-					}
-				}
-			}
-		}
-
-		if mp, ok := m.(map[string]interface{}); ok {
-			for k, v := range mp {
-				if val, ok := v.(string); ok {
-					if base64Regexp.MatchString(val) {
-						ba, err := base64.StdEncoding.DecodeString(val)
-						if err == nil {
-							var sample interface{}
-							err = json.Unmarshal(ba, &sample)
-							if err == nil {
-								mp[k] = sample
-								m = mp
-							}
-						}
-					}
-				}
-			}
-		}
-		singleRowImg[k] = m
-
-	}
-	return singleRowImg, err
-}
-
 func ParseNestedJSON(value interface{}) interface{} {
 	switch v := value.(type) {
 	case map[string]interface{}:
@@ -375,11 +426,15 @@ func ParseNestedJSON(value interface{}) interface{} {
 		if base64Regexp.MatchString(v) {
 			ba, err := base64.StdEncoding.DecodeString(v)
 			if err == nil {
-				return ParseNestedJSON(string(ba)) // Convert bytes back to string
+				// Attempt to unmarshal the base64 decoded bytes as JSON
+				var m interface{}
+				if err := json.Unmarshal(ba, &m); err == nil {
+					return ParseNestedJSON(m)
+				}
+				return ba
 			}
 		}
-		return v // Keep string as is
-	case float64:
+		// Keep string as is if not base64 encoded
 		return v
 	default:
 		return v
